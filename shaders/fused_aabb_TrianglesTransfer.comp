@@ -1,0 +1,34 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : enable
+
+#include "shared/types.glsl"
+#include "shared/data_bvh.h"
+#include "shared/data_fused.h"
+#include "shared/data_plocpp.h"
+
+layout(local_size_x_id = 0) in;
+
+layout(push_constant, scalar) uniform uPushConstant {
+    PC_TriangleTransfer data;
+} pc;
+
+layout(buffer_reference, scalar) buffer RuntimeData {
+    FUSEDData ploc;
+};
+
+void main() {
+    u32 globalId = gl_GlobalInvocationID.x;
+    RuntimeData data = RuntimeData(pc.data.runtimeDataAddress);
+    if (globalId >= data.ploc.leafCounter) return;
+
+    LEAFMAP leafMap = LEAFMAP(pc.data.triangleMapAddress);
+
+    BvhTriangles inputTriangles = BvhTriangles(pc.data.inputTrianglesAddress);
+    BvhTriangleIndices inputTriangleIndices = BvhTriangleIndices(pc.data.inputTriangleIndicesAddress);
+    BvhTriangles outputTriangles = BvhTriangles(pc.data.outputTrianglesAddress);
+    BvhTriangleIndices outputTriangleIndices = BvhTriangleIndices(pc.data.outputTriangleIndicesAddress);
+
+    outputTriangles.t[leafMap.node[globalId].finalIdx] = inputTriangles.t[globalId];
+    outputTriangleIndices.val[leafMap.node[globalId].finalIdx] = inputTriangleIndices.val[globalId];
+}

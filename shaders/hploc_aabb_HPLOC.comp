@@ -1,0 +1,290 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+
+#include "shared/types.glsl"
+#include "shared/compute.glsl"
+#include "shared/bv_aabb.glsl"
+#include "shared/data_bvh.h"
+#include "shared/data_plocpp.h"
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 1) const u32 sc_SubgroupSize = 32;
+
+layout(push_constant, scalar) uniform uPushConstant {
+    PC_PlocppIterationIndirect data;
+} pc;
+
+layout(buffer_reference, scalar) buffer RuntimeData {
+    Scheduler sched;
+    PLOCData ploc;
+};
+
+// Lowest set bit of a 64-bit mask, -1 if there is none
+i32 findLSB64(u64 mask){
+    uvec2 parts = unpackUint2x32(mask);
+
+    i32 lsb = findLSB(parts.x);
+    if (lsb != -1) {
+        return lsb;
+    }
+    lsb = findLSB(parts.y);
+    if (lsb != -1) {
+        return lsb + 32;
+    }
+
+    return -1;
+}
+// Position of the n-th set bit (counted from 1), -1 if there is none
+u32 findNSB(u32 mask, u32 n) {
+    if (n == 0 || n > bitCount(mask)) return -1;
+
+    u32 pos = 0;
+    u32 count;
+
+    count = bitCount(mask & 0xFFFFu);
+    if (n > count) { n -= count; mask >>= 16; pos += 16; }
+
+    count = bitCount(mask & 0xFFu);
+    if (n > count) { n -= count; mask >>= 8; pos += 8; }
+
+    count = bitCount(mask & 0xFu);
+    if (n > count) { n -= count; mask >>= 4; pos += 4; }
+
+    count = bitCount(mask & 0x3u);
+    if (n > count) { n -= count; mask >>= 2; pos += 2; }
+
+    count = mask & 0x1u;
+    if (n > count) { pos += 1; }
+
+    return pos;
+}
+
+u32 findNSB64(u64 mask, u32 n) {
+    if (n == 0) return -1;
+
+    u32 low = uint(mask & 0xFFFFFFFFu);
+    u32 pop_low = bitCount(low);
+
+    if (n <= pop_low) {
+        return findNSB(low, n);
+    }
+    else {
+        u32 high = uint(mask >> 32);
+        u32 pop_high = bitCount(high);
+
+        if (n > pop_low + pop_high) return -1;
+
+        return findNSB(high, n - pop_low) + 32;
+    }
+}
+
+u32 mergeClusters(BVH2_AABB bvh, RuntimeData data, u32 numPrims, u64 NN, inout u32 CI, inout AABB myBB) {
+    u32 memoryIdLocal = gl_SubgroupInvocationID;
+
+    u32 myNeighbour = u32(subgroupShuffle(u32(NN), memoryIdLocal));
+    myNeighbour = (myNeighbour == INVALID_ID) ? 0 : myNeighbour;
+    u32 hisNeighbour = u32(subgroupShuffle(u32(NN), myNeighbour));
+    bool symmetricMatchFound = (memoryIdLocal == hisNeighbour);
+    bool laneIsLeftNeighbor = (memoryIdLocal < myNeighbour);
+
+    const u32 myNodeId = CI;
+    const u32 rightNodeId = subgroupShuffle(CI, myNeighbour);
+
+    bool laneHasCluster = (memoryIdLocal < numPrims);
+    bool laneIsCreatingNode = ((laneHasCluster) && (symmetricMatchFound) && (laneIsLeftNeighbor));
+    const uvec4 ballot = subgroupBallot(laneIsCreatingNode);
+    u32 mergedId;
+    if (memoryIdLocal == 0)
+        mergedId = atomicAdd(data.ploc.bvOffset, subgroupBallotBitCount(ballot));
+    mergedId = subgroupBroadcastFirst(mergedId) + subgroupBallotExclusiveBitCount(ballot);
+
+    u32 newCI = INVALID_ID;
+    if (laneHasCluster) {
+        newCI = CI;
+        if (symmetricMatchFound) {
+            AABB rightBB;
+            rightBB.min = subgroupShuffle(myBB.min, myNeighbour);
+            rightBB.max = subgroupShuffle(myBB.max, myNeighbour);
+            if (laneIsLeftNeighbor) {
+                AABB bvC0 = myBB;
+                bvFit(bvC0, rightBB);
+
+                i32 sizeC0 = bvh.node[myNodeId].size;
+                i32 sizeC1 = bvh.node[rightNodeId].size;
+                bvh.node[myNodeId].parent = i32(mergedId);
+                bvh.node[rightNodeId].parent = i32(mergedId);
+                bvh.node[mergedId].bv = bvC0;
+                bvh.node[mergedId].size = sizeC0 + sizeC1;
+                bvh.node[mergedId].parent = INVALID_ID;
+                bvh.node[mergedId].c0 = sizeC0 == 1 ? ~i32(myNodeId) : i32(myNodeId);
+                bvh.node[mergedId].c1 = sizeC1 == 1 ? ~i32(rightNodeId) : i32(rightNodeId);
+
+                myBB = bvC0;
+                newCI = mergedId;
+            }
+            else
+                newCI = INVALID_ID;
+        }
+    }
+
+    // Compact nodes
+    const u32 flag = (newCI != INVALID_ID) ? 1 : 0;
+    const u32 ps = laneHasCluster ? flag : 0;
+    const u32 total_reduction = subgroupBallotBitCount(subgroupBallot(bool(ps)));
+    const u32 compactionShuffle = findNSB64(packUint2x32(subgroupBallot(bool(ps)).xy), memoryIdLocal + 1);
+
+    CI = newCI != INVALID_ID ? newCI : CI;
+    CI = subgroupShuffle(CI, compactionShuffle);
+    myBB.min = subgroupShuffle(myBB.min, compactionShuffle);
+    myBB.max = subgroupShuffle(myBB.max, compactionShuffle);
+    if(compactionShuffle == -1){
+        CI = INVALID_ID;
+    }
+    return total_reduction;
+}
+
+u64 nearest_neighbour_subgroup(u32 clusterCount, AABB myBB) {
+    u32 laneId = gl_SubgroupInvocationID;
+    u64 myBest = INVALID_ID;
+    AABB neighborBv;
+
+    for (u32 offset = 1; offset <= 16; ++offset) {
+        u32 neighborLane = laneId + offset;
+        neighborBv.min = subgroupShuffleDown(myBB.min, offset);
+        neighborBv.max = subgroupShuffleDown(myBB.max, offset);
+        u64 area = 0xFFFFFFFFu;
+        if (neighborLane != laneId && neighborLane < clusterCount) {
+            bvFit(neighborBv, myBB);
+            area = floatBitsToUint(bvArea(neighborBv));
+            u64 encoded = (area << 32) | neighborLane;
+            myBest = min(myBest, encoded);
+        }
+        neighborLane = laneId - offset;
+        area = subgroupShuffleUp(u32(area), offset);
+        if(laneId < clusterCount && laneId >= offset)
+            myBest = min(myBest, (area << 32) | neighborLane);
+    }
+    return myBest;
+}
+
+u32 loadIndices(u32 start, u32 end, u32_buf I, inout u32 CI, u32 offset){
+    u32 numIndices = min(end - start, u32(sc_SubgroupSize / 2));
+    i32 indexID = i32(gl_SubgroupInvocationID - offset);
+    bool laneActive = ((indexID >= 0) && (indexID < numIndices));
+    if (laneActive)
+        CI = atomicExchange(I.val[start + indexID], INVALID_ID);
+    u32 numValid = subgroupBallotBitCount(subgroupBallot(laneActive && (CI != INVALID_ID)));
+    numIndices = min(numIndices, numValid);
+    return numIndices;
+}
+
+void hploc_merge(u32 laneID, u32 L, u32 R, u32 split, bool final) {
+    BVH2_AABB bvh = BVH2_AABB(pc.data.bvhAddress);
+
+    u32_buf I = u32_buf(pc.data.nodeId0Address);
+    RuntimeData data = RuntimeData(pc.data.runtimeDataAddress);
+    u32 Lstart = subgroupBroadcast(L, laneID);
+    u32 Lend = subgroupBroadcast(split, laneID);
+    u32 Rstart = subgroupBroadcast(split, laneID);
+    u32 Rend = subgroupBroadcast(R, laneID) + 1;
+
+    u32 CI = INVALID_ID;
+    u32 numLeft = loadIndices(Lstart, Lend, I, CI, 0);
+    u32 numRight = loadIndices(Rstart, Rend, I, CI, numLeft);
+    u32 numPrims = numLeft + numRight;
+    AABB myBV;
+
+    if (CI != INVALID_ID)
+        myBV = bvh.node[CI].bv;
+    else
+        myBV = dummyAABB();
+
+    u32 THRESHOLD = subgroupBroadcast(final, laneID) == true ? 1 : sc_SubgroupSize / 2;
+    while (numPrims > THRESHOLD) {
+        u64 NN = nearest_neighbour_subgroup(numPrims, myBV);
+        numPrims = mergeClusters(bvh, data, numPrims, NN, CI, myBV);
+    }
+
+    if (gl_SubgroupInvocationID < (numLeft + numRight)){
+        atomicExchange(I.val[Lstart + gl_SubgroupInvocationID], CI);
+    }
+}
+
+i32 delta(i32 NodeID, u32 N, Morton32KeyVals morton32) {
+    if (NodeID < 0 || NodeID >= i32(N - 1)) {
+        return -1;
+    }
+
+    u32 key1 = morton32.keyval[NodeID].mortonCode;
+    u32 key2 = morton32.keyval[NodeID + 1].mortonCode;
+
+    if (key1 == key2) {
+        return 32 + 31 - findMSB(u32(NodeID ^ (NodeID + 1)));
+    }
+
+    return 31 - findMSB(key1 ^ key2);
+}
+
+u32 findParentID(u32 L, u32 R, u32 N, Morton32KeyVals morton32) {
+    if (L == 0 || (R != N - 1 && delta(i32(R), N, morton32) > delta(i32(L) - 1, N, morton32))) {
+        return R;
+    } else {
+        return L - 1;
+    }
+}
+
+void buildBVH2(){
+    i32_buf pID = i32_buf(pc.data.parentIDsAddress);
+    Morton32KeyVals morton32 = Morton32KeyVals(pc.data.nodeId1Address);
+    i32 L, R;
+    i32 previousID, split;
+    u32 N = pc.data.triangleCount;
+    L = R = i32(gl_GlobalInvocationID.x);
+    bool laneActive = gl_GlobalInvocationID.x < N;
+    while(subgroupBallot(laneActive) != uvec4(0)){
+        split = -1;
+        if(laneActive){
+            previousID = -1;
+            if(findParentID(L, R, N, morton32) == R){
+                previousID = atomicExchange(pID.val[R], L);
+                if(previousID != -1){
+                    split = R + 1;
+                    R = previousID;
+                }
+            }
+            else{
+                previousID = atomicExchange(pID.val[L-1], R);
+                if(previousID != -1){
+                    split = L;
+                    L = previousID;
+                }
+            }
+            if(previousID == -1)
+                laneActive = false;
+        }
+        u32 size = R - L + 1;
+        bool final = laneActive && (size == N);
+        u64 waveMask = packUint2x32(subgroupBallot((laneActive && (size > (sc_SubgroupSize / 2))) || final).xy);
+        while(waveMask != 0){
+            u32 laneID = findLSB64(waveMask);
+            hploc_merge(laneID, L, R, split, final);
+            waveMask = waveMask & (waveMask-1);
+        }
+    }
+}
+
+void main() {
+    RuntimeData data = RuntimeData(pc.data.runtimeDataAddress);
+
+    if (gl_GlobalInvocationID.x == 0) {
+        u32_buf clusterCount = u32_buf(pc.data.idbAddress);
+        atomicExchange(data.ploc.bvOffset, clusterCount.val[0]);
+    }
+
+    buildBVH2();
+}
